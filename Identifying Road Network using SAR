@@ -1,0 +1,61 @@
+// Load SAR data (e.g., Sentinel-1 GRD)
+var sentinel1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(geometry) // Define your area of interest (AOI)
+  .filterDate('2023-01-01', '2023-12-31') // Define your time range
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .select('VV'); // Select VV polarization band
+
+// Mosaic and reduce the image collection
+var sarImage = sentinel1.median();
+
+// Visualize the SAR image
+Map.centerObject(geometry, 10);
+Map.addLayer(sarImage, {min: -25, max: 5}, 'SAR Image');
+
+// Apply a speckle filter (optional for reducing noise)
+function speckleFilter(image) {
+  return image.focal_median(50, 'circle', 'meters');
+}
+var filteredImage = speckleFilter(sarImage);
+
+// Thresholding to detect features of interest
+var threshold = -15; // Adjust this based on your use case
+var binary = filteredImage.gt(threshold);
+
+// Edge detection for identifying linear features
+var cannyEdge = ee.Algorithms.CannyEdgeDetector({
+  image: filteredImage,
+  threshold: 1.5,
+  sigma: 1
+});
+
+// Define a connectedness kernel (e.g., 8-connected pixels)
+var connectedness = ee.Kernel.plus(1); // 8-connected neighborhood
+
+// Detect and extract connected components
+var connectedComponents = binary.connectedComponents({
+  connectedness: connectedness, // Specify the connectedness kernel
+  maxSize: 128 // Maximum size of objects to label
+});
+
+
+// Extract road-like features (optional: add specific masks or filters)
+var roadMask = connectedComponents.select('labels').clip(geometry);
+
+// Convert the detected network into vector format
+var roadVector = roadMask.reduceToVectors({
+  geometryType: 'polygon',
+  reducer: ee.Reducer.countEvery(),
+  scale: 10,
+  bestEffort: true // Allow adjustment of scale to fit within pixel limits
+});
+
+// Add road network to the map
+Map.addLayer(roadVector, {color: 'red'}, 'Detected Road Network');
+
+// Export the detected road network as a shapefile
+Export.table.toDrive({
+  collection: roadVector,
+  description: 'RoadNetwork',
+  fileFormat: 'SHP'
+});
