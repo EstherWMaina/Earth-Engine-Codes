@@ -1,0 +1,249 @@
+// Load Murang'a boundary
+var region = Kenya.filter(ee.Filter.eq("COUNTY", "Murang'a"));
+
+// Load Sentinel-1 data
+var sentinel = ee.ImageCollection("COPERNICUS/S1_GRD")
+    .filterBounds(region)
+    .filterDate('2017-06-01', '2017-06-30')
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+    .median();
+    //.clip(region.geometry().bounds()); // Ensure clipping
+var sentinel1= sentinel
+    .resample('bilinear') // Options: 'nearest', 'bilinear', 'bicubic'
+    .reproject({
+        crs: 'EPSG:4326',  // WGS84 projection
+        scale: 4           // 4m spatial resolution
+    });
+print(sentinel1)
+//Load Planet Image
+var planet=ee.ImageCollection("projects/planet-nicfi/assets/basemaps/africa")
+             .filterBounds(region)
+             .filterDate('2017-06-01', '2017-06-30')
+             .mean()
+             .clip(region)
+             .divide(10000);
+             
+
+// Terrain Correction Function (Fixed)
+function terrainCorrection(image) { 
+  var imgGeom = region.geometry().bounds(); // Ensure bounded geometry
+  var srtm = ee.Image('USGS/SRTMGL1_003').clip(imgGeom); // Clip SRTM DEM
+  var sigma0Pow = ee.Image.constant(10).pow(image.divide(10.0));
+
+  // Radar Geometry
+  var theta_i = image.select('angle');
+
+  // Ensure phi_i is always a Number
+  var phi_i = ee.Terrain.aspect(theta_i)
+    .reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: region,
+      scale: 1000,
+      maxPixels: 1e13
+    })
+    .getNumber('aspect');  // Use getNumber() to force numeric value
+
+  phi_i = ee.Algorithms.If(phi_i, phi_i, 0); // Ensure default value is a Number
+  var phi_iImage = ee.Image.constant(ee.Number(phi_i)); // Convert Number to Image
+
+  // Terrain Geometry
+  var alpha_s = ee.Terrain.slope(srtm).select('slope');
+  var phi_s = ee.Terrain.aspect(srtm).select('aspect');
+
+  // Model Geometry
+  var phi_r = phi_iImage.subtract(phi_s);
+  var phi_rRad = phi_r.multiply(Math.PI / 180);
+  var alpha_sRad = alpha_s.multiply(Math.PI / 180);
+  var theta_iRad = theta_i.multiply(Math.PI / 180);
+  var ninetyRad = ee.Image.constant(90).multiply(Math.PI / 180);
+
+  // Slope calculations
+  var alpha_r = (alpha_sRad.tan().multiply(phi_rRad.cos())).atan();
+  var alpha_az = (alpha_sRad.tan().multiply(phi_rRad.sin())).atan();
+  var theta_lia = (alpha_az.cos().multiply((theta_iRad.subtract(alpha_r)).cos())).acos();
+  var theta_liaDeg = theta_lia.multiply(180 / Math.PI);
+
+  // Gamma Nought Flat
+  var gamma0 = sigma0Pow.divide(theta_iRad.cos());
+  var gamma0dB = ee.Image.constant(10).multiply(gamma0.log10());
+  var ratio_1 = gamma0dB.select('VV').subtract(gamma0dB.select('VH'));
+
+  // Volumetric Model
+  var nominator = (ninetyRad.subtract(theta_iRad).add(alpha_r)).tan();
+  var denominator = (ninetyRad.subtract(theta_iRad)).tan();
+  var volModel = (nominator.divide(denominator)).abs();
+
+  // Apply Model
+  var gamma0_Volume = gamma0.divide(volModel);
+  var gamma0_VolumeDB = ee.Image.constant(10).multiply(gamma0_Volume.log10());
+
+  // Layover and Shadow Mask
+  var alpha_rDeg = alpha_r.multiply(180 / Math.PI);
+  var layover = alpha_rDeg.lt(theta_i);
+  var shadow = theta_liaDeg.lt(85);
+
+  // Calculate Ratio for Visualization
+  var ratio = gamma0_VolumeDB.select('VV').subtract(gamma0_VolumeDB.select('VH'));
+
+  var output = gamma0_VolumeDB.addBands(ratio).addBands(alpha_r).addBands(phi_s).addBands(theta_iRad)
+    .addBands(layover).addBands(shadow).addBands(gamma0dB).addBands(ratio_1);
+
+  return image.addBands(
+    output.select(['VV', 'VH'], ['VV', 'VH']),
+    null,
+    true
+  );
+}
+
+// Apply Terrain Correction
+var correctedS1 = terrainCorrection(sentinel);
+//add NDVI band to planet image
+function calcNdvi(image){
+  var ndvi=image.normalizedDifference(['N','R']).rename('NDVI')
+  return image.addBands(ndvi);
+  }
+//calculate ndvi and add to the image
+var planet_ndvi=calcNdvi(planet);
+var s1bands=sentinel.select(['VV','VH']);
+//combine the s1 and planet
+var combImg=planet_ndvi.addBands(s1bands);
+print(combImg.bandNames(),'bands');
+//Image classification
+
+//Creating Training Data
+var trainingData = Vegetation.merge(Water).merge(Agriculture).merge(BuiltUp).merge(BareLand).merge(Water).merge(GrassLand);
+
+var bands = ["B","G","R","N","NDVI",'VV','VH'];
+var labels = 'class';
+var inputImage = combImg.select(bands);
+
+//Create Training Image
+var trainingImage = inputImage.sampleRegions({
+                               collection:trainingData,
+                               properties:[labels],
+                               scale:1
+});
+
+//Randomize the data
+var dataSamples = trainingImage.randomColumn();
+
+//selection of training and validation sets
+var trainingSet = dataSamples.filter(ee.Filter.lessThan('random',0.75));
+var validationSet = dataSamples.filter(ee.Filter.greaterThanOrEquals('random',0.75));
+
+//Train the random forest classifier
+var classifier = ee.Classifier.smileRandomForest(10).train(trainingSet,labels,bands);
+//Classify the Image
+var classifiedImage = combImg.classify(classifier);
+//Create a colorramp/palette for classified image
+var classPalette={palette:['red','green','#f3cb06','#954f4f','#1100a1','#a2fdad'],
+                   min:0,
+                   max:5,
+};
+
+//Visualize classified Image
+//Map.addLayer(classifiedImage,classPalette,'Classified_Image2024');
+
+//Accuracy Assessment
+var testClassifiedImage = validationSet.classify(classifier);
+print(testClassifiedImage,'Classified_Image');
+//Generating Confusion Matrix
+var confusionMatrix = testClassifiedImage.errorMatrix(labels,'classification');
+
+//Print Confusion MMatrix
+print('Confusion_Matrix:',confusionMatrix);
+print('Confusion_Matrix_Table:',confusionMatrix.getInfo());
+
+//Computing Overall Accuracy
+var overallAccuracy = confusionMatrix.accuracy();
+print('Overall_Accuracy:', overallAccuracy);
+
+//Computing Producer's Accuracy
+var producerAccuracy = confusionMatrix.producersAccuracy();
+print('Producers_Accuracy:',producerAccuracy);
+
+//Computing User's Accuracy
+var userAccuracy = confusionMatrix.consumersAccuracy();
+print('Users_Accuracy:',userAccuracy);
+
+//Calculation of Kappa Accuracy
+var kappaAccuracy = confusionMatrix.kappa();
+print('Kappa_Accuracy:',kappaAccuracy);
+//Generate random points in the ROI
+function generatedRandomPoints(region,numberOfPoints){
+  var randomPoints = ee.FeatureCollection.randomPoints(region,count);
+  return randomPoints;
+}
+
+//Specify the count and the region
+var count = 250;
+var region = region;
+
+//Apply the function to get the random points
+var randomPoints = generatedRandomPoints(region,count);
+
+var exportedPoints = ee.FeatureCollection(randomPoints);
+
+//Generate points with LULC Classes
+var pointsAttributed = classifiedImage.sample({
+  region:exportedPoints,
+  geometries:true,
+  projection:'EPSG: 4326',
+  scale:10
+});
+
+// Visualization
+Map.addLayer(combImg,imageVisParam2,'CombinedImg')
+Map.centerObject(region, 12);
+//Map.addLayer(combImg,{bands:['R','G','B'],min:100,max:1000},'CombinedImg')
+Map.addLayer(classifiedImage,classPalette,'Classified_Image2024');
+Export.table.toDrive({
+  collection: trainingData,  // FeatureCollection to export
+  description: 'ElgeyoMarakwet_GT_Features', // Task name
+  folder: 'GEE_Exports', // Google Drive folder (optional)
+  fileNamePrefix: 'ElgeyoMarakwet', // File name
+  fileFormat: 'SHP' // Options: 'CSV', 'SHP', 'GeoJSON', 'KML'
+});
+var vectors = classifiedImage.reduceToVectors({
+  geometryType: 'polygon',  // Generates polygons
+  reducer: ee.Reducer.countEvery(),  // Counts pixels in each class
+  scale: 10,  // Adjust scale as per your data resolution
+  geometry: region,  // Limit processing to ROI
+  eightConnected: false,  // Use four-connected pixels (change if needed)
+  labelProperty: 'class',  // The property name in the vector output
+  bestEffort: true
+});
+// Function to extract and export each class separately
+function exportClass(classValue, className) {
+  var singleClass = classifiedImage.updateMask(classifiedImage.eq(classValue)); // Mask other classes
+
+  // Vectorize the selected class
+  var vectorized = singleClass.reduceToVectors({
+    geometryType: 'polygon',
+    reducer: ee.Reducer.countEvery(),
+    scale: 2, // Adjust based on resolution
+    geometry: region, // Limit processing to ROI
+    labelProperty: 'class',
+    bestEffort: true
+  });
+
+  // Export the vectorized class
+  Export.table.toDrive({
+    collection: vectorized,
+    description: 'ElgeyoMarakwet_' + className, // Unique name for each class
+    folder: 'GEE_Exports',
+    fileNamePrefix: 'ElgeyoMarakwet_' + className,
+    fileFormat: 'SHP' // Options: 'CSV', 'SHP', 'GeoJSON', 'KML'
+  });
+
+  // Add layer to map for visualization
+  Map.addLayer(vectorized, {color: 'red'}, className);
+}
+
+// Call the function for each class (Adjust class values accordingly)
+exportClass(0, 'BuiltUp');
+exportClass(1, 'Vegetation');
+exportClass(2, 'Agriculture');
+exportClass(3, 'BareLand');
+exportClass(4, 'Water');
+exportClass(5, 'GrassLand');
