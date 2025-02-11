@@ -16,39 +16,21 @@ var cropClassMap = {
   'Tea': 11, 'Others': 12, 'Arrow Roots': 13 // Added missing class
 };
 
-// Function to convert string crop names to numbers
-trainingData = trainingData.map(function(feature) {
-  var cropName = feature.get('Class'); // Get the crop type as a string
-  var cropID = ee.Algorithms.If(cropClassMap[cropName], cropClassMap[cropName], 0); // Default to 0 if not found
-  return feature.set('crop_type', ee.Number(cropID)); // Ensure numeric type
-});
-
-// Function to filter and map crop types correctly
+// ✅ Corrected Mapping: Assign crop types safely
 trainingData = trainingData.map(function(feature) {
   var cropName = feature.get('Class'); // Get crop name
-  var cropID = cropClassMap[cropName]; // Get corresponding class ID
-  
-  // If the crop isn't in cropClassMap, assign it to "Others" (12)
-  cropID = ee.Algorithms.If(ee.Number(cropID).gt(0), cropID, 12);
-  
+  var cropID = ee.Dictionary(cropClassMap).get(cropName, 12); // Default to "Others" (12) if not found
   return feature.set('crop_type', ee.Number(cropID)); // Ensure numeric type
 });
 
-// Filter out null or invalid crop_type values
-trainingData = trainingData.filter(ee.Filter.neq('crop_type', null));
-
-// Print unique classes to verify
+// ✅ Debugging: Print unique crop classes to verify correct mapping
 var uniqueClasses = trainingData.aggregate_array('crop_type').distinct();
 print("✅ Unique Crop Classes in Training Data:", uniqueClasses);
 
-
-// Print sample training data to verify 'crop_type' is correctly assigned
-print("Sample Training Data:", trainingData.limit(5));
-
-// Define bands using correct Planet NICFI band names
+// ✅ Define bands using correct Planet NICFI band names
 var bands = ['B', 'G', 'R', 'N']; // Blue, Green, Red, Near-Infrared
 
-// Compute Vegetation Indices using corrected band names
+// ✅ Compute Vegetation Indices using corrected band names
 var ndvi = planetComposite.normalizedDifference(['N', 'R']).rename('NDVI'); // (NIR - Red) / (NIR + Red)
 var ndwi = planetComposite.normalizedDifference(['G', 'N']).rename('NDWI'); // (Green - NIR) / (Green + NIR)
 var evi = planetComposite.expression(
@@ -58,10 +40,10 @@ var evi = planetComposite.expression(
       'B': planetComposite.select('B')
 }).rename('EVI');
 
-// Combine selected bands and indices
+// ✅ Combine selected bands and indices
 var inputImage = planetComposite.select(bands).addBands([ndvi, evi, ndwi]);
 
-// Prepare training data (using updated numeric labels)
+// ✅ Prepare training data (using updated numeric labels)
 var labeledData = inputImage.sampleRegions({
   collection: trainingData,
   properties: ['crop_type'], // Now using numeric labels
@@ -69,20 +51,23 @@ var labeledData = inputImage.sampleRegions({
   tileScale: 4
 });
 
-// Train a Random Forest Classifier
+// ✅ Debugging: Check if labeled data contains multiple classes
+print("📌 Labeled Data Sample:", labeledData.limit(5));
+
+// ✅ Train a Random Forest Classifier
 var classifier = ee.Classifier.smileRandomForest(50).train({
   features: labeledData,
   classProperty: 'crop_type',
   inputProperties: inputImage.bandNames()
 });
 
-// Classify the image
+// ✅ Classify the image
 var classified = inputImage.classify(classifier);
 
-// Apply crop mask AFTER classification
+// ✅ Apply crop mask AFTER classification
 classified = classified.updateMask(cropMask);
 
-// Define visualization parameters
+// ✅ Define visualization parameters
 var visParams = {
   min: 1,
   max: 13,
@@ -90,11 +75,11 @@ var visParams = {
             '800000', '808000', '008000', '800080', '008080', '808080', 'A52A2A']
 };
 
-// Center map and add classification layer
+// ✅ Center map and add classification layer
 Map.centerObject(trainingData, 10);
 Map.addLayer(classified, visParams, 'Crop Classification');
 
-// Add a legend for crop types
+// ✅ Add a legend for crop types
 var legend = ui.Panel({style: {position: 'bottom-left', padding: '8px', backgroundColor: 'white'}});
 legend.add(ui.Label({value: 'Crop Type Legend', style: {fontWeight: 'bold'}}));
 
@@ -110,5 +95,5 @@ Object.keys(cropClassMap).forEach(function(cropName) {
 
 Map.add(legend);
 
-// Print crop classes to console
-print('Crop Classes:', cropClassMap);
+// ✅ Print crop classes to console
+print('🌱 Crop Classes:', cropClassMap);
