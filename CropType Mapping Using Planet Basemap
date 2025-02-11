@@ -6,68 +6,76 @@ var planetBasemap = ee.ImageCollection("projects/planet-nicfi/assets/basemaps/af
 // Print available bands to verify correct names
 print("Available bands in Planet NICFI:", planetBasemap.first().bandNames());
 
-// Select a single composite image from Planet NICFI basemap
-var planetComposite = planetBasemap.filterDate('2024-11-01', '2024-12-31').mosaic();
-
-// Define crop class mapping (assigning numeric values)
+// Define crop class mapping
 var cropClassMap = {
   'Avocado': 1, 'Bananas': 2, 'Beans': 3, 'Coffee': 4, 'Macadamia': 5,
   'Maize': 6, 'Mango': 7, 'Pineapples': 8, 'Rice': 9, 'Sorghum': 10,
-  'Tea': 11, 'Others': 12, 'Arrow Roots': 13 // Added missing class
+  'Tea': 11, 'Others': 12, 'Arrow Roots': 13
 };
 
-// ✅ Corrected Mapping: Assign crop types safely
+// Assign numeric crop types
 trainingData = trainingData.map(function(feature) {
-  var cropName = feature.get('Class'); // Get crop name
-  var cropID = ee.Dictionary(cropClassMap).get(cropName, 12); // Default to "Others" (12) if not found
-  return feature.set('crop_type', ee.Number(cropID)); // Ensure numeric type
+  var cropName = feature.get('Class');
+  var cropID = ee.Dictionary(cropClassMap).get(cropName, 12); // Default: "Others"
+  return feature.set('crop_type', ee.Number(cropID));
 });
 
-// ✅ Debugging: Print unique crop classes to verify correct mapping
-var uniqueClasses = trainingData.aggregate_array('crop_type').distinct();
-print("✅ Unique Crop Classes in Training Data:", uniqueClasses);
+// Print unique crop classes
+print("Unique Crop Classes in Training Data:", trainingData.aggregate_array('crop_type').distinct());
 
-// ✅ Define bands using correct Planet NICFI band names
+// Define Planet NICFI bands
 var bands = ['B', 'G', 'R', 'N']; // Blue, Green, Red, Near-Infrared
 
-// ✅ Compute Vegetation Indices using corrected band names
-var ndvi = planetComposite.normalizedDifference(['N', 'R']).rename('NDVI'); // (NIR - Red) / (NIR + Red)
-var ndwi = planetComposite.normalizedDifference(['G', 'N']).rename('NDWI'); // (Green - NIR) / (Green + NIR)
-var evi = planetComposite.expression(
-    '2.5 * ((N - R) / (N + 6 * R - 7.5 * B + 1))', {
-      'N': planetComposite.select('N'),
-      'R': planetComposite.select('R'),
-      'B': planetComposite.select('B')
+// Load Planet NICFI Composite
+var seasons = planetBasemap.filterDate('2024-11-01', '2024-12-31').select(bands);
+
+// Compute Vegetation Indices for Planet
+var ndvi = seasons.mean().normalizedDifference(['N', 'R']).rename('NDVI');
+var ndwi = seasons.mean().normalizedDifference(['G', 'N']).rename('NDWI');
+var evi = seasons.mean().expression(
+  '2.5 * ((N - R) / (N + 6 * R - 7.5 * B + 1))', {
+    'N': seasons.mean().select('N'),
+    'R': seasons.mean().select('R'),
+    'B': seasons.mean().select('B')
 }).rename('EVI');
 
-// ✅ Combine selected bands and indices
-var inputImage = planetComposite.select(bands).addBands([ndvi, evi, ndwi]);
+// 🛰️ Load Sentinel-2 (To Get Red Edge Band for NDRE)
+var sentinel = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterDate('2024-11-01', '2024-12-31')
+  .filterBounds(trainingData.geometry()) // Clip to study area
+  .select(['B5', 'B8']) // B5 (Red Edge) and B8 (NIR)
+  .median(); // Use median composite
 
-// ✅ Prepare training data (using updated numeric labels)
+// 🌿 Compute NDRE: (NIR - RE) / (NIR + RE)
+var ndre = sentinel.normalizedDifference(['B8', 'B5']).rename('NDRE');
+
+// 🌍 Merge Planet + Sentinel-2 Features
+var inputImage = seasons.mean().select(bands) // Planet NICFI bands
+  .addBands([ndvi, evi, ndwi]) // Planet Indices
+  .addBands(ndre); // Sentinel-2 NDRE
+
+// Prepare training data
 var labeledData = inputImage.sampleRegions({
   collection: trainingData,
-  properties: ['crop_type'], // Now using numeric labels
-  scale: 4, 
+  properties: ['crop_type'],
+  scale: 10, // Use Sentinel resolution (10m)
   tileScale: 4
 });
 
-// ✅ Debugging: Check if labeled data contains multiple classes
-print("📌 Labeled Data Sample:", labeledData.limit(5));
-
-// ✅ Train a Random Forest Classifier
-var classifier = ee.Classifier.smileRandomForest(50).train({
+// Train a Random Forest Classifier
+var classifier = ee.Classifier.smileRandomForest(100).train({
   features: labeledData,
   classProperty: 'crop_type',
   inputProperties: inputImage.bandNames()
 });
 
-// ✅ Classify the image
+// Classify the image
 var classified = inputImage.classify(classifier);
 
-// ✅ Apply crop mask AFTER classification
+// Apply crop mask
 classified = classified.updateMask(cropMask);
 
-// ✅ Define visualization parameters
+// Visualization
 var visParams = {
   min: 1,
   max: 13,
@@ -75,19 +83,17 @@ var visParams = {
             '800000', '808000', '008000', '800080', '008080', '808080', 'A52A2A']
 };
 
-// ✅ Center map and add classification layer
+// Center map and add layers
 Map.centerObject(trainingData, 10);
 Map.addLayer(classified, visParams, 'Crop Classification');
 
-// ✅ Add a legend for crop types
+// Add a legend
 var legend = ui.Panel({style: {position: 'bottom-left', padding: '8px', backgroundColor: 'white'}});
 legend.add(ui.Label({value: 'Crop Type Legend', style: {fontWeight: 'bold'}}));
 
 Object.keys(cropClassMap).forEach(function(cropName) {
-  var classValue = cropClassMap[cropName]; // Get numeric ID
-  var colorBox = ui.Label({
-    style: {backgroundColor: visParams.palette[classValue - 1], padding: '6px', margin: '2px', width: '20px'}
-  });
+  var classValue = cropClassMap[cropName];
+  var colorBox = ui.Label({style: {backgroundColor: visParams.palette[classValue - 1], padding: '6px', margin: '2px', width: '20px'}});
   var label = ui.Label(cropName);
   var row = ui.Panel([colorBox, label], ui.Panel.Layout.Flow('horizontal'));
   legend.add(row);
@@ -95,5 +101,12 @@ Object.keys(cropClassMap).forEach(function(cropName) {
 
 Map.add(legend);
 
-// ✅ Print crop classes to console
-print('🌱 Crop Classes:', cropClassMap);
+// Feature Importance Analysis
+print('Feature Importance:', classifier.explain().get('importance'));
+
+// Confusion Matrix & Accuracy Metrics
+var validation = labeledData.randomColumn().filter(ee.Filter.gt('random', 0.7));
+var confusionMatrix = validation.classify(classifier).errorMatrix('crop_type', 'classification');
+print('Confusion Matrix:', confusionMatrix);
+print('Producer Accuracy:', confusionMatrix.producersAccuracy());
+print('User Accuracy:', confusionMatrix.consumersAccuracy());
