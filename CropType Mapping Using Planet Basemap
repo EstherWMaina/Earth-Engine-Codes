@@ -1,6 +1,6 @@
 // Load required datasets
 var trainingData = ee.FeatureCollection('projects/esther-mainaesther77/assets/FieldData');
-var cropMask = ee.Image('projects/esther-mainaesther77/assets/Cropmask25');
+var cropMask = ee.Image('projects/esther-mainaesther77/assets/cropmask24');
 var planetBasemap = ee.ImageCollection("projects/planet-nicfi/assets/basemaps/africa");
 
 // Print available bands to verify correct names
@@ -9,14 +9,13 @@ print("Available bands in Planet NICFI:", planetBasemap.first().bandNames());
 // Define crop class mapping
 var cropClassMap = {
   'Avocado': 1, 'Bananas': 2, 'Beans': 3, 'Coffee': 4, 'Macadamia': 5,
-  'Maize': 6, 'Mango': 7, 'Pineapples': 8, 'Rice': 9, 'Sorghum': 10,
-  'Tea': 11, 'Others': 12, 'Arrow Roots': 13
+  'Maize': 6, 'Mango': 7, 'Rice': 8, 'Sorghum': 9, 'Tea': 10, 'Others': 11
 };
 
 // Assign numeric crop types
 trainingData = trainingData.map(function(feature) {
   var cropName = feature.get('Class');
-  var cropID = ee.Dictionary(cropClassMap).get(cropName, 12); // Default: "Others"
+  var cropID = ee.Dictionary(cropClassMap).get(cropName, 11); // Default: "Others"
   return feature.set('crop_type', ee.Number(cropID));
 });
 
@@ -78,9 +77,9 @@ classified = classified.updateMask(cropMask);
 // Visualization
 var visParams = {
   min: 1,
-  max: 13,
+  max: 11,
   palette: ['FF0000', '00FF00', '0000FF', 'FFFF00', 'FF00FF', '00FFFF',
-            '800000', '808000', '008000', '800080', '008080', '808080', 'A52A2A']
+            '800000', '808000', '008000', '800080', '808080']
 };
 
 // Center map and add layers
@@ -110,3 +109,14 @@ var confusionMatrix = validation.classify(classifier).errorMatrix('crop_type', '
 print('Confusion Matrix:', confusionMatrix);
 print('Producer Accuracy:', confusionMatrix.producersAccuracy());
 print('User Accuracy:', confusionMatrix.consumersAccuracy());
+
+// Export classified image to Google Drive
+Export.image.toDrive({
+  image: classified,
+  description: 'Crop_Classification',
+  scale: 10,
+  region: trainingData.geometry(),
+  fileFormat: 'GeoTIFF',
+  maxPixels: 1e13
+});
+
