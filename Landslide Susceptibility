@@ -1,0 +1,235 @@
+// ====================================================
+// LANDSLIDE SUSCEPTIBILITY MAPPING USING WEIGHTED OVERLAY
+// ====================================================
+
+// Define Area of Interest (AOI) and time parameters
+var aoi = ee.Geometry.Rectangle([-122.3, 37.5, -121.9, 37.8]); // Example: San Francisco Bay Area
+var startDate = '2020-01-01';
+var endDate = '2020-12-31';
+
+// 1. DATA ACQUISITION
+// -------------------
+// Get Digital Elevation Model and calculate slope
+var dem = ee.Image('USGS/SRTMGL1_003').clip(aoi);
+var slope = ee.Terrain.slope(dem).rename('slope');
+
+// Get Sentinel-2 imagery and calculate NDVI
+var sentinel2 = ee.ImageCollection('COPERNICUS/S2_SR')
+    .filterDate(startDate, endDate)
+    .filterBounds(aoi)
+    .median()
+    .clip(aoi);
+var ndvi = sentinel2.normalizedDifference(['B8', 'B4']).rename('ndvi');
+
+// Get Sentinel-1 imagery for soil moisture estimation
+var sentinel1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+    .filterDate(startDate, endDate)
+    .filterBounds(aoi)
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+    .mean()
+    .clip(aoi);
+var soilMoisture = sentinel1.select('VV').rename('soil_moisture');
+
+// Get precipitation data from CHIRPS
+var precipitation = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+    .filterDate(startDate, endDate)
+    .mean()
+    .clip(aoi)
+    .rename('precipitation');
+
+// 2. FEATURE NORMALIZATION (0-1 range)
+// ------------------------------------
+// Function to normalize an image to 0-1 range
+var normalizeImage = function(image) {
+  var minMax = image.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry: aoi,
+    scale: 100,
+    maxPixels: 1e13
+  });
+  
+  return image.unitScale(
+    ee.Number(minMax.get(image.bandNames().get(0) + '_min')),
+    ee.Number(minMax.get(image.bandNames().get(0) + '_max'))
+  );
+};
+
+// Normalize all input layers
+var slopeNorm = normalizeImage(slope);
+var ndviNorm = normalizeImage(ndvi).multiply(-1).add(1); // Invert NDVI (lower vegetation = higher risk)
+var soilMoistureNorm = normalizeImage(soilMoisture);
+var precipitationNorm = normalizeImage(precipitation);
+
+// 3. APPLY WEIGHTED OVERLAY
+// -------------------------
+// Define weights based on your formula: 0.4*Slope + 0.2*NDVI + 0.2*SoilMoisture + 0.2*Precipitation
+var susceptibility = slopeNorm.multiply(0.4)
+  .add(ndviNorm.multiply(0.2))
+  .add(soilMoistureNorm.multiply(0.2))
+  .add(precipitationNorm.multiply(0.2))
+  .rename('landslide_susceptibility');
+
+// 4. CLASSIFY INTO RISK CATEGORIES
+// --------------------------------
+// Create classified risk categories (optional)
+var riskCategories = susceptibility
+  .where(susceptibility.lt(0.2), 1) // Very Low
+  .where(susceptibility.gte(0.2).and(susceptibility.lt(0.4)), 2) // Low
+  .where(susceptibility.gte(0.4).and(susceptibility.lt(0.6)), 3) // Medium
+  .where(susceptibility.gte(0.6).and(susceptibility.lt(0.8)), 4) // High
+  .where(susceptibility.gte(0.8), 5) // Very High
+  .rename('risk_category');
+
+// 5. VISUALIZATION
+// ----------------
+// Define visualization parameters
+var susceptibilityVis = {
+  min: 0,
+  max: 1,
+  palette: ['green', 'yellow', 'orange', 'red', 'darkred']
+};
+
+var categoryVis = {
+  min: 1,
+  max: 5,
+  palette: ['green', 'lightgreen', 'yellow', 'orange', 'red']
+};
+
+// Center the map on the AOI
+Map.centerObject(aoi, 10);
+
+// Add input layers to the map
+Map.addLayer(slope, {min: 0, max: 45}, 'Slope');
+Map.addLayer(ndvi, {min: -1, max: 1, palette: ['red', 'yellow', 'green']}, 'NDVI');
+Map.addLayer(soilMoisture, {min: -20, max: 0}, 'Soil Moisture (VV)');
+Map.addLayer(precipitation, {min: 0, max: 10}, 'Precipitation');
+
+// Add results to the map
+Map.addLayer(susceptibility, susceptibilityVis, 'Landslide Susceptibility Index');
+Map.addLayer(riskCategories, categoryVis, 'Risk Categories');
+
+// 6. ADD LEGEND
+// -------------
+// Function to create a custom legend
+function addLegend() {
+  var legend = ui.Panel({
+    style: {
+      position: 'bottom-right',
+      padding: '8px 15px',
+      backgroundColor: 'white'
+    }
+  });
+  
+  // Add legend title
+  var legendTitle = ui.Label({
+    value: 'Landslide Susceptibility',
+    style: {
+      fontWeight: 'bold',
+      fontSize: '14px',
+      margin: '0 0 4px 0',
+      padding: '0'
+    }
+  });
+  legend.add(legendTitle);
+  
+  // Define the color palette and labels
+  var palette = ['green', 'yellow', 'orange', 'red', 'darkred'];
+  var names = ['Very Low', 'Low', 'Medium', 'High', 'Very High'];
+  var values = ['0.0-0.2', '0.2-0.4', '0.4-0.6', '0.6-0.8', '0.8-1.0'];
+  
+  // Create and style a row for each color
+  for (var i = 0; i < palette.length; i++) {
+    var colorBox = ui.Label({
+      style: {
+        backgroundColor: palette[i],
+        padding: '8px',
+        margin: '0 0 4px 0'
+      }
+    });
+    
+    var description = ui.Label({
+      value: names[i] + ' (' + values[i] + ')',
+      style: {
+        margin: '0 0 4px 8px',
+        fontSize: '12px'
+      }
+    });
+    
+    var row = ui.Panel({
+      layout: ui.Panel.Layout.Flow('horizontal'),
+      widgets: [colorBox, description]
+    });
+    
+    legend.add(row);
+  }
+  
+  Map.add(legend);
+}
+
+addLegend();
+
+// 7. EXPORT RESULTS
+// -----------------
+// Export the susceptibility map as GeoTIFF
+Export.image.toDrive({
+  image: susceptibility,
+  description: 'LandslideSusceptibilityIndex',
+  scale: 100,
+  region: aoi,
+  fileFormat: 'GeoTIFF',
+  maxPixels: 1e13
+});
+
+// Export the categorized risk map
+Export.image.toDrive({
+  image: riskCategories,
+  description: 'LandslideRiskCategories',
+  scale: 100,
+  region: aoi,
+  fileFormat: 'GeoTIFF',
+  maxPixels: 1e13
+});
+
+// 8. STATISTICAL ANALYSIS
+// -----------------------
+// Calculate area statistics for each risk category
+var areaImage = ee.Image.pixelArea().addBands(riskCategories);
+
+var areaStats = areaImage.reduceRegion({
+  reducer: ee.Reducer.sum().group({
+    groupField: 1,
+    groupName: 'risk_category'
+  }),
+  geometry: aoi,
+  scale: 100,
+  maxPixels: 1e13
+});
+
+// Print area statistics
+print('Area by risk category (square meters):', areaStats);
+
+// 9. ADDITIONAL ANALYSIS (OPTIONAL)
+// ---------------------------------
+// Calculate and print basic statistics for the susceptibility index
+var stats = susceptibility.reduceRegion({
+  reducer: ee.Reducer.mean().combine(ee.Reducer.stdDev(), null, true),
+  geometry: aoi,
+  scale: 100,
+  maxPixels: 1e13
+});
+
+print('Susceptibility Index Statistics:', stats);
+
+// Display histogram of susceptibility values
+var histogram = ui.Chart.image.histogram({
+  image: susceptibility,
+  region: aoi,
+  scale: 100,
+  minBucketWidth: 0.05
+}).setOptions({
+  title: 'Landslide Susceptibility Distribution',
+  hAxis: {title: 'Susceptibility Index'},
+  vAxis: {title: 'Pixel Count'}
+});
+
+print(histogram);
