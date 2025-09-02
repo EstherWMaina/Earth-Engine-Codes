@@ -1,235 +1,227 @@
-// ====================================================
-// LANDSLIDE SUSCEPTIBILITY MAPPING USING WEIGHTED OVERLAY
-// ====================================================
+// -------------------- AOI --------------------
+/* var aoi = ee.FeatureCollection('projects/project-hakika/assets/ken_admbnda_adm1_iebc_20191031')
+  .filter(ee.Filter.eq('ADM1_EN', "Murang'a"));
+Map.centerObject(aoi, 9);
+*/ 
+// -------------------- time and date--------------------
+var time_start = '2023-01-01';
+var time_end = '2023-12-31';
 
-// Define Area of Interest (AOI) and time parameters
-var aoi = ee.Geometry.Rectangle([-122.3, 37.5, -121.9, 37.8]); // Example: San Francisco Bay Area
-var startDate = '2020-01-01';
-var endDate = '2020-12-31';
-
-// 1. DATA ACQUISITION
-// -------------------
-// Get Digital Elevation Model and calculate slope
+// -------------------- DEM --------------------
 var dem = ee.Image('USGS/SRTMGL1_003').clip(aoi);
-var slope = ee.Terrain.slope(dem).rename('slope');
 
-// Get Sentinel-2 imagery and calculate NDVI
-var sentinel2 = ee.ImageCollection('COPERNICUS/S2_SR')
-    .filterDate(startDate, endDate)
-    .filterBounds(aoi)
-    .median()
-    .clip(aoi);
-var ndvi = sentinel2.normalizedDifference(['B8', 'B4']).rename('ndvi');
+// ----------------------------------------------
+// 1. TOPOGRAPHY: SLOPE & ELEVATION
+// ----------------------------------------------
+var slope = ee.Terrain.slope(dem);
+var aspect = ee.Terrain.aspect(dem);
+var elevation = dem;
 
-// Get Sentinel-1 imagery for soil moisture estimation
-var sentinel1 = ee.ImageCollection('COPERNICUS/S1_GRD')
-    .filterDate(startDate, endDate)
-    .filterBounds(aoi)
-    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
-    .mean()
-    .clip(aoi);
-var soilMoisture = sentinel1.select('VV').rename('soil_moisture');
+// Slope Reclassification (example thresholds, adjust to local conditions)
+var slopeClass = slope.expression(
+  "(b('slope') < 15) ? 1" +        // low susceptibility
+  ": (b('slope') < 30) ? 2" +      // moderate
+  ": (b('slope') < 45) ? 3" +      // high
+  ": 4",                           // very high
+  { 'slope': slope }
+).rename('slopeClass');
 
-// Get precipitation data from CHIRPS
-var precipitation = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
-    .filterDate(startDate, endDate)
-    .mean()
-    .clip(aoi)
-    .rename('precipitation');
+// Elevation Class
+var elevClass = elevation.select('elevation')
+  .lt(1500).multiply(1)
+  .where(elevation.gte(1500).and(elevation.lt(2000)), 2)
+  .where(elevation.gte(2000).and(elevation.lt(2500)), 3)
+  .where(elevation.gte(2500), 4)
+  .rename('elevClass');
 
-// 2. FEATURE NORMALIZATION (0-1 range)
-// ------------------------------------
-// Function to normalize an image to 0-1 range
-var normalizeImage = function(image) {
-  var minMax = image.reduceRegion({
-    reducer: ee.Reducer.minMax(),
+// ----------------------------------------------
+// 2. VEGETATION COVER ANALYSIS (NDVI)
+// ----------------------------------------------
+var s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+                                    .filterBounds( aoi)
+                                    .filterDate(time_start, time_end)
+                                    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+                                    .select(['B8', 'B4'])
+                                    .mean()
+                                    .clip( aoi);
+                                    
+var ndvi = s2.normalizedDifference(['B8', 'B4']).rename('NDVI');
+
+// Reclassify NDVI
+var ndviClass = ndvi.expression(
+  "(b('ndvi') < 0.2) ? 4" + // Low NDVI (low veg cover) = high risk
+  ": (b('ndvi') < 0.4) ? 3" +
+  ": (b('ndvi') < 0.6) ? 2" +
+  ": 1", // High NDVI (dense veg cover) = low risk
+  { 'ndvi': ndvi }
+).rename('ndviClass');
+
+
+// ----------------------------------------------
+// 3. SOIL MOISTURE (Radar-Based - Sentinel-1)
+// ----------------------------------------------
+var sentinel1 = ee.ImageCollection("COPERNICUS/S1_GRD")
+                                     .filterBounds( aoi)
+                                     .filterDate(time_start, time_end)
+                                     .filter(ee.Filter.eq('instrumentMode', 'IW'))
+                                     .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+                                     .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+                                     .select(['VV', 'VH'])
+                                     .mean()
+                                     .clip( aoi);
+                                     
+print('Sentinel-1 count', ee.ImageCollection("COPERNICUS/S1_GRD")
+  .filterBounds( aoi)
+  .filterDate(time_start, time_end)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .size());
+
+var soilMoisture = sentinel1.expression(
+  '(VH - VV) / (VH + VV)', {
+    'VH': sentinel1.select('VH'),
+    'VV': sentinel1.select('VV')
+  }).rename('SoilMoisture');
+
+// ----------------------------------------------
+// 4. PRECIPITATION (Rainfall from CHIRPS)
+// ----------------------------------------------
+var precipitation = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+                                          .filterBounds( aoi)
+                                          .filterDate(time_start, time_end)
+                                          .sum()
+                                          .rename('Precipitation')
+                                          .clip( aoi);
+
+
+// ----------------------------------------------
+// 3. LAND COVER
+// ----------------------------------------------
+var landcover = ee.Image('ESA/WorldCover/v200/2021').clip(aoi);
+// Assign higher risk to bare areas, croplands, built-up
+var lcRisk = landcover.remap(
+  [10,20,30,40,50,60,70,80,90,95,100],   // ESA classes
+  [1, 1, 2, 2, 3, 2, 3, 2, 3, 2, 1]     // risk scores
+).rename('lcRisk');
+
+// -------------------- Landslide Susceptibility Index (LSI) --------------------
+
+var lsi = slopeClass.add(elevClass).add(lcRisk).rename('LSI');
+
+// Get the maximum value of the LSI image.
+var maxVal = ee.Number(
+  lsi.reduceRegion({
+    reducer: ee.Reducer.max(),
     geometry: aoi,
-    scale: 100,
-    maxPixels: 1e13
-  });
-  
-  return image.unitScale(
-    ee.Number(minMax.get(image.bandNames().get(0) + '_min')),
-    ee.Number(minMax.get(image.bandNames().get(0) + '_max'))
-  );
-};
+    scale: 30,
+    maxPixels: 1e9
+  }).get('LSI')
+);
 
-// Normalize all input layers
-var slopeNorm = normalizeImage(slope);
-var ndviNorm = normalizeImage(ndvi).multiply(-1).add(1); // Invert NDVI (lower vegetation = higher risk)
-var soilMoistureNorm = normalizeImage(soilMoisture);
-var precipitationNorm = normalizeImage(precipitation);
+// Convert the number to a constant image.
+var maxValImage = ee.Image.constant(maxVal);
 
-// 3. APPLY WEIGHTED OVERLAY
-// -------------------------
-// Define weights based on your formula: 0.4*Slope + 0.2*NDVI + 0.2*SoilMoisture + 0.2*Precipitation
-var susceptibility = slopeNorm.multiply(0.4)
-  .add(ndviNorm.multiply(0.2))
-  .add(soilMoistureNorm.multiply(0.2))
-  .add(precipitationNorm.multiply(0.2))
-  .rename('landslide_susceptibility');
+// Normalize the LSI image by dividing it by the constant image.
+// This is the correct way to perform normalization in GEE.
+var lsiNorm = lsi.divide(maxValImage).rename('LSI_norm');
 
-// 4. CLASSIFY INTO RISK CATEGORIES
-// --------------------------------
-// Create classified risk categories (optional)
-var riskCategories = susceptibility
-  .where(susceptibility.lt(0.2), 1) // Very Low
-  .where(susceptibility.gte(0.2).and(susceptibility.lt(0.4)), 2) // Low
-  .where(susceptibility.gte(0.4).and(susceptibility.lt(0.6)), 3) // Medium
-  .where(susceptibility.gte(0.6).and(susceptibility.lt(0.8)), 4) // High
-  .where(susceptibility.gte(0.8), 5) // Very High
-  .rename('risk_category');
+// -------------------- Visualization --------------------
+Map.addLayer(slope, {min:0, max:60, palette:['white','yellow','orange','red']}, 'Slope (deg)');
 
-// 5. VISUALIZATION
-// ----------------
-// Define visualization parameters
-var susceptibilityVis = {
-  min: 0,
-  max: 1,
-  palette: ['green', 'yellow', 'orange', 'red', 'darkred']
-};
+// Add Title
+var title = ui.Label({
+  value: "Landslide Susceptibility Analysis",
+  style: { fontSize: '20px', fontWeight: 'bold', margin: '10px' }
+});
+Map.add(title);
 
-var categoryVis = {
-  min: 1,
-  max: 5,
-  palette: ['green', 'lightgreen', 'yellow', 'orange', 'red']
-};
+Map.addLayer(lsiNorm, {min:0, max:1, palette:['green','yellow','red']}, 'Landslide Susceptibility');
 
-// Center the map on the AOI
-Map.centerObject(aoi, 10);
 
-// Add input layers to the map
-Map.addLayer(slope, {min: 0, max: 45}, 'Slope');
-Map.addLayer(ndvi, {min: -1, max: 1, palette: ['red', 'yellow', 'green']}, 'NDVI');
-Map.addLayer(soilMoisture, {min: -20, max: 0}, 'Soil Moisture (VV)');
-Map.addLayer(precipitation, {min: 0, max: 10}, 'Precipitation');
-
-// Add results to the map
-Map.addLayer(susceptibility, susceptibilityVis, 'Landslide Susceptibility Index');
-Map.addLayer(riskCategories, categoryVis, 'Risk Categories');
-
-// 6. ADD LEGEND
-// -------------
-// Function to create a custom legend
-function addLegend() {
-  var legend = ui.Panel({
-    style: {
-      position: 'bottom-right',
-      padding: '8px 15px',
-      backgroundColor: 'white'
-    }
-  });
-  
-  // Add legend title
-  var legendTitle = ui.Label({
-    value: 'Landslide Susceptibility',
-    style: {
-      fontWeight: 'bold',
-      fontSize: '14px',
-      margin: '0 0 4px 0',
-      padding: '0'
-    }
-  });
-  legend.add(legendTitle);
-  
-  // Define the color palette and labels
-  var palette = ['green', 'yellow', 'orange', 'red', 'darkred'];
-  var names = ['Very Low', 'Low', 'Medium', 'High', 'Very High'];
-  var values = ['0.0-0.2', '0.2-0.4', '0.4-0.6', '0.6-0.8', '0.8-1.0'];
-  
-  // Create and style a row for each color
-  for (var i = 0; i < palette.length; i++) {
-    var colorBox = ui.Label({
-      style: {
-        backgroundColor: palette[i],
-        padding: '8px',
-        margin: '0 0 4px 0'
-      }
-    });
-    
-    var description = ui.Label({
-      value: names[i] + ' (' + values[i] + ')',
-      style: {
-        margin: '0 0 4px 8px',
-        fontSize: '12px'
-      }
-    });
-    
-    var row = ui.Panel({
-      layout: ui.Panel.Layout.Flow('horizontal'),
-      widgets: [colorBox, description]
-    });
-    
-    legend.add(row);
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-left',
+    padding: '8px',
+    backgroundColor: 'white'
   }
-  
-  Map.add(legend);
+});
+legend.add(ui.Label('Landslide Risk Map', { fontWeight: 'bold' }));
+
+// Legend Colors and Labels
+var colors = ['green', 'yellow', 'red'];
+var labels = ['Low Risk', 'Moderate Risk', 'High Risk'];
+
+for (var i = 0; i < colors.length; i++) {
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: colors[i],
+      width: '30px',
+      height: '30px',
+      margin: '5px'
+    }
+  });
+  var label = ui.Label(labels[i], { margin: '4px 6px' });
+  legend.add(ui.Panel([colorBox, label], ui.Panel.Layout.Flow('horizontal')));
 }
 
-addLegend();
+Map.add(legend);
 
-// 7. EXPORT RESULTS
-// -----------------
-// Export the susceptibility map as GeoTIFF
+
+// -------------------- Export --------------------
 Export.image.toDrive({
-  image: susceptibility,
-  description: 'LandslideSusceptibilityIndex',
-  scale: 100,
-  region: aoi,
-  fileFormat: 'GeoTIFF',
+  image: lsiNorm,
+  description: 'Landslide_Susceptibility_Muranga_2',
+  folder: 'Muranga',
+  scale: 30,
+  region: aoi.geometry(),
+  crs: 'EPSG:4326',
   maxPixels: 1e13
 });
 
-// Export the categorized risk map
-Export.image.toDrive({
-  image: riskCategories,
-  description: 'LandslideRiskCategories',
-  scale: 100,
-  region: aoi,
-  fileFormat: 'GeoTIFF',
-  maxPixels: 1e13
-});
 
-// 8. STATISTICAL ANALYSIS
-// -----------------------
-// Calculate area statistics for each risk category
-var areaImage = ee.Image.pixelArea().addBands(riskCategories);
+// -------------------- CHARTS FOR STATISTICAL ANALYSIS --------------------
 
-var areaStats = areaImage.reduceRegion({
-  reducer: ee.Reducer.sum().group({
-    groupField: 1,
-    groupName: 'risk_category'
-  }),
+var normSlope = slope.divide(ee.Image.constant(slope.reduceRegion({
+  reducer: ee.Reducer.max(),
   geometry: aoi,
-  scale: 100,
-  maxPixels: 1e13
-});
+  scale: 30
+}).get('slope')));
 
-// Print area statistics
-print('Area by risk category (square meters):', areaStats);
-
-// 9. ADDITIONAL ANALYSIS (OPTIONAL)
-// ---------------------------------
-// Calculate and print basic statistics for the susceptibility index
-var stats = susceptibility.reduceRegion({
-  reducer: ee.Reducer.mean().combine(ee.Reducer.stdDev(), null, true),
+var normNDVI = ndvi.divide(ee.Image.constant(ndvi.reduceRegion({
+  reducer: ee.Reducer.max(),
   geometry: aoi,
-  scale: 100,
-  maxPixels: 1e13
-});
+  scale: 30
+}).get('NDVI')));
 
-print('Susceptibility Index Statistics:', stats);
+var normSoilMoisture = soilMoisture.divide(ee.Image.constant(soilMoisture.reduceRegion({
+  reducer: ee.Reducer.max(),
+  geometry: aoi,
+  scale: 30
+}).get('SoilMoisture')));
 
-// Display histogram of susceptibility values
-var histogram = ui.Chart.image.histogram({
-  image: susceptibility,
-  region: aoi,
-  scale: 100,
-  minBucketWidth: 0.05
-}).setOptions({
-  title: 'Landslide Susceptibility Distribution',
-  hAxis: {title: 'Susceptibility Index'},
-  vAxis: {title: 'Pixel Count'}
-});
+var normPrecipitation = precipitation.divide(ee.Image.constant(precipitation.reduceRegion({
+  reducer: ee.Reducer.max(),
+  geometry: aoi,
+  scale: 30
+}).get('Precipitation')));
 
-print(histogram);
+var landslideStats = ee.FeatureCollection([
+  ee.Feature(null, { 'Factor': 'Slope', 'Value': normSlope.reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: aoi, scale: 500, maxPixels: 1e13 }).get('slope') }),
+  ee.Feature(null, { 'Factor': 'Vegetation', 'Value': normNDVI.reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: aoi, scale: 500, maxPixels: 1e13 }).get('NDVI') }),
+  ee.Feature(null, { 'Factor': 'Soil Moisture', 'Value': normSoilMoisture.reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: aoi, scale: 500, maxPixels: 1e13 }).get('SoilMoisture') }),
+  ee.Feature(null, { 'Factor': 'Precipitation', 'Value': normPrecipitation.reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: aoi, scale: 500, maxPixels: 1e13 }).get('Precipitation') })
+]);
+
+var chart = ui.Chart.feature.byFeature(landslideStats, 'Factor', 'Value')
+  .setChartType('ColumnChart')
+  .setOptions({
+    title: 'Landslide Risk Factors',
+    hAxis: { title: 'Factor' },
+    vAxis: { title: 'Normalized Value' },
+    series: { 0: { color: 'red' } }
+  });
+
+print(chart);
